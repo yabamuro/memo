@@ -1,0 +1,172 @@
+import boto3
+import codecs
+import math
+import json
+import logging
+import sys
+import time
+from datetime import datetime
+from boto3.dynamodb.conditions import Key, Attr
+
+# Logging Init
+logger = logging.getLogger()
+logger.setLevel( logging.INFO )
+
+
+# Definition
+AWS_ACCOUNT             = 'YOUR-AWS-ACCOUNT-ID'
+COMMON_PATH             = 'blazingtext/subwords/target/'
+ENDPOINT_NAME           = 'blazingtext-20XX-XX-XX-XX-XX-XX-XXX'
+S3_AWS_REGION           = 'ap-northeast-1'
+SAGEMAKER_BUCKET_NAME   = 'sagemaker-' + S3_AWS_REGION + '-' + AWS_ACCOUNT
+S3_BASE_PATH            = 's3://' + SAGEMAKER_BUCKET_NAME + '/' + COMMON_PATH
+S3_TRAIN_FULLPATH       = S3_BASE_PATH + 'train/train_data'
+S3_MODEL_PATH           = '/output/model.tar.gz'
+S3_PREFIX               = 'blazingtext-'
+S3_TRAIN_PATH           = COMMON_PATH +'train/' 
+S3_TRAIN_KEY            = S3_TRAIN_PATH + 'train_data'
+S3_TIMESTAMP_KEY        = COMMON_PATH + 'last_modified_time_of_train_data.txt'
+S3_OUTPUT_PATH          = S3_BASE_PATH + 'output'
+SAGEMAKER_ROLE_ARN      = 'arn:aws:iam::' + AWS_ACCOUNT + ':role/service-role/AmazonSageMaker-ExecutionRole-20XXXXXXXXXXXXX'
+TRAINING_IMAGE          = '501404015308.dkr.ecr.ap-northeast-1.amazonaws.com/blazingtext:latest'
+
+def lambda_handler(event, context):
+    logger.info( 'event = %s', event  )
+    logger.info( 'context = %s',context )
+    
+    try:
+        """ Check whether training data has already been updated or not """
+        s3_client           = boto3.client( 's3' )
+        s3_train_bucket     = s3_client.get_object( Bucket = SAGEMAKER_BUCKET_NAME, Key = S3_TRAIN_KEY )
+        last_modified_time  = s3_train_bucket['ResponseMetadata']['HTTPHeaders']['last-modified']
+        s3_timestamp_bucket = s3_client.get_object( Bucket = SAGEMAKER_BUCKET_NAME, Key = S3_TIMESTAMP_KEY )
+        s3_train_timestamp  = s3_timestamp_bucket['Body'].read().decode( 'utf-8' )
+        if( last_modified_time == s3_train_timestamp ):
+            logger.info( 'S3 TRAIN_DATA NOTHING TO CHANGE(%s)', s3_train_timestamp )
+            return '0'
+        else:
+            response = s3_client.put_object(Body=last_modified_time, Bucket=SAGEMAKER_BUCKET_NAME, Key=S3_TIMESTAMP_KEY)
+            
+        """ Create Training Job  """
+        training_job_name      = S3_PREFIX + datetime.now().strftime( '%Y-%m-%d-%H-%M-%S-%f' )[:-3]
+        sagemaker_client       = boto3.client( 'sagemaker' )
+        training_job_response  = sagemaker_client.create_training_job(
+                                     TrainingJobName = training_job_name,
+                                     HyperParameters = { 
+                                         'batch_size': '11', 
+                                         'epochs': '5', 
+                                         'evaluation': 'True', 
+                                         'learning_rate': '0.05', 
+                                         'max_char': '6', 
+                                         'min_char': '3', 
+                                         'min_count': '5',
+                                         'mode': 'skipgram', 
+                                         'negative_samples': '5',
+                                         'sampling_threshold': '0.0001',
+                                         'subwords': 'True', 
+                                         'vector_dim': '100', 
+                                         'window_size': '5'
+                                     },
+                                     AlgorithmSpecification = {
+                                         'TrainingImage': TRAINING_IMAGE,
+                                         'TrainingInputMode': 'File'
+                                     },
+                                     RoleArn = SAGEMAKER_ROLE_ARN ,
+                                     InputDataConfig = [
+                                         {
+                                             'ChannelName': 'train', 
+                                             'DataSource': {
+                                                 'S3DataSource': {
+                                                     'S3DataType': 'S3Prefix', 
+                                                     'S3Uri': S3_TRAIN_FULLPATH,
+                                                     'S3DataDistributionType': 'FullyReplicated'
+                                                 }
+                                             }, 
+                                             'ContentType': 'text/plain', 
+                                             'CompressionType': 'None', 
+                                             'RecordWrapperType': 'None'
+                                         }
+                                     ],
+                                     OutputDataConfig = {
+                                         'KmsKeyId': '', 
+                                         'S3OutputPath': S3_OUTPUT_PATH
+                                     },
+                                     ResourceConfig = {
+                                         'InstanceType': 'ml.c4.2xlarge',
+                                         'InstanceCount': 10, 
+                                         'VolumeSizeInGB': 30
+                                     },
+                                     StoppingCondition = {
+                                        'MaxRuntimeInSeconds': 360000
+                                     }
+                                 )
+        training_job_arn = training_job_response['TrainingJobArn']
+        logger.info( 'TrainingJobArn = %s', training_job_arn )
+        while( True ):
+            training_job_info   = sagemaker_client.describe_training_job(
+                                      TrainingJobName = training_job_name
+                                  )
+            training_job_status = training_job_info['TrainingJobStatus']
+            if( training_job_status == 'Completed' ):
+                break
+            elif( training_job_status == 'Failed' ):
+                logger.info( 'S3 TRAIN JOB Failed' )
+                return 0
+            else:
+                time.sleep( 1 )
+        logger.info( 'TrainingJobStatus = %s', training_job_status )
+        
+        """ Create Model """
+        s3_model_path      = S3_OUTPUT_PATH + '/' + training_job_name + S3_MODEL_PATH
+        s3_model_name      = S3_PREFIX + datetime.now().strftime( '%Y-%m-%d-%H-%M-%S-%f' )[:-3]
+        s3_model_response  = sagemaker_client.create_model(
+                                 ModelName = s3_model_name,
+                                 ExecutionRoleArn = SAGEMAKER_ROLE_ARN,
+                                 PrimaryContainer = {
+                                     'ModelDataUrl' : s3_model_path,
+                                     'Image' : TRAINING_IMAGE
+                                 }
+                             )
+        s3_model_arn = s3_model_response['ModelArn']
+        logger.info( 'ModelArn = %s', s3_model_arn )
+        
+        """ Create the Endoint setting """
+        endpoint_conf_name      = S3_PREFIX + datetime.now().strftime('%Y-%m-%d-%H-%M-%S-%f')[:-3]
+        endpoint_conf_response  = sagemaker_client.create_endpoint_config(
+                                      EndpointConfigName = endpoint_conf_name,
+                                      ProductionVariants = [
+                                           {
+                                               'VariantName': 'variant-name-2',
+                                               'ModelName': s3_model_name,
+                                               'InitialInstanceCount': 10,
+                                               'InstanceType': 'ml.m4.xlarge',
+                                            },
+                                      ]
+                                  )
+        endpoint_conf_arn = endpoint_conf_response['EndpointConfigArn']
+        logger.info( 'EndpointConfigArn = %s', endpoint_conf_arn )
+        
+        """ Update the Endpoint """
+        endpoint_response = sagemaker_client.update_endpoint(
+                                EndpointName       = ENDPOINT_NAME,
+                                EndpointConfigName = endpoint_conf_name
+                             )
+        endpoint_arn = endpoint_response['EndpointArn']
+        logger.info( 'EndpointArn = %s', endpoint_arn )
+        while( True ):
+            endpoint_description = sagemaker_client.describe_endpoint(
+                                       EndpointName = ENDPOINT_NAME
+                                   )
+            endpoint_status = endpoint_description['EndpointStatus']
+            if( endpoint_status == 'InService' ):
+                logger.info( 'Complete Updating Endpoint' )
+                break
+            elif( endpoint_status == 'Failed'):
+                logger.info( 'Status of Endoint is %s', endpoint_status )
+                break
+            else:
+                time.sleep( 1 )
+    except:
+        logger.info( 'Update SageMaker Endpoint Error. %s, %s, %s',
+                     str(sys.exc_info()[0]), str(sys.exc_info()[1]), str(sys.exc_info()[2].tb_lineno) ) 
+    return '0'
